@@ -20,6 +20,9 @@ import logger from '../utils/logger.js';
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const CTF_BALANCE_ABI = ['function balanceOf(address account, uint256 id) view returns (uint256)'];
 
+// Polymarket CLOB minimum order size (shares)
+const CLOB_MIN_ORDER_SHARES = 5;
+
 /**
  * Get actual on-chain ERC1155 token balance for the proxy wallet.
  * Used before market-sell to avoid 'not enough balance' errors from partial fills.
@@ -109,15 +112,37 @@ async function marketSell(tokenId, shares, tickSize, negRisk) {
 
 async function isOrderFilled(orderId, shares) {
     if (!orderId || orderId.startsWith('sim-')) return false;
+    const MAX_FILL_RETRIES = 2;
+    for (let attempt = 1; attempt <= MAX_FILL_RETRIES; attempt++) {
+        try {
+            const client = getClient();
+            const order = await client.getOrder(orderId);
+            if (!order) return false;
+            if (order.status === 'MATCHED') return true;
+            const matched = parseFloat(order.size_matched || '0');
+            return matched >= shares * 0.99;
+        } catch (err) {
+            logger.warn(`MM: isOrderFilled error (attempt ${attempt}/${MAX_FILL_RETRIES}): ${err.message}`);
+            if (attempt < MAX_FILL_RETRIES) await sleep(2000);
+        }
+    }
+    return false;
+}
+
+/**
+ * Get partial fill amount for an order (how many shares already matched).
+ * Returns 0 on error.
+ */
+async function getOrderMatched(orderId) {
+    if (!orderId || orderId.startsWith('sim-')) return 0;
     try {
         const client = getClient();
         const order = await client.getOrder(orderId);
-        if (!order) return false;
-        if (order.status === 'MATCHED') return true;
-        const matched = parseFloat(order.size_matched || '0');
-        return matched >= shares * 0.99;
+        if (!order) return 0;
+        if (order.status === 'MATCHED') return parseFloat(order.original_size || order.size || '0');
+        return parseFloat(order.size_matched || '0');
     } catch {
-        return false;
+        return 0;
     }
 }
 
@@ -329,6 +354,19 @@ async function adaptiveLegCL(pos, unfilledKey) {
         return;
     }
 
+    // If remaining shares below CLOB minimum, market sell immediately instead of trying limit
+    if (sellShares < CLOB_MIN_ORDER_SHARES) {
+        logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} remaining ${sellShares.toFixed(3)} shares < ${CLOB_MIN_ORDER_SHARES} minimum — market selling immediately`);
+        const result   = await marketSell(s.tokenId, sellShares, tickSize, negRisk);
+        s.fillPrice    = result.fillPrice;
+        s.filled       = true;
+        pos.status     = 'done';
+        const pnl      = (s.fillPrice - s.entryPrice) * sellShares;
+        const combined = filledLegPrice + s.fillPrice;
+        logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} market-sold ${sellShares.toFixed(3)} sh @ $${s.fillPrice.toFixed(3)} | combined $${combined.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+        return;
+    }
+
     logger.info(`MM adaptive CL: monitoring ${unfilledKey.toUpperCase()} — limit only when price ≥ $${minAdaptivePrice.toFixed(3)}, market-sell only at CL time`);
 
     let activeOrderId    = null;
@@ -410,9 +448,33 @@ async function adaptiveLegCL(pos, unfilledKey) {
 
         // ── Place limit only above the profitable floor ─────────────────────
         if (!activeOrderId) {
+            // Re-check actual balance — partial fills may have reduced it
+            const currentBalance = await getTokenBalance(s.tokenId);
+            const remainingShares = currentBalance !== null ? currentBalance : sellShares;
+
+            if (remainingShares < 0.001) {
+                logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} balance is 0 — fully sold via partial fills`);
+                s.fillPrice = config.mmSellPrice;
+                s.filled    = true;
+                pos.status  = 'done';
+                return;
+            }
+
+            if (remainingShares < CLOB_MIN_ORDER_SHARES) {
+                logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} remaining ${remainingShares.toFixed(3)} shares < ${CLOB_MIN_ORDER_SHARES} minimum — market selling`);
+                const result   = await marketSell(s.tokenId, remainingShares, tickSize, negRisk);
+                s.fillPrice    = result.fillPrice;
+                s.filled       = true;
+                pos.status     = 'done';
+                const pnl      = (s.fillPrice - s.entryPrice) * remainingShares;
+                const combined = filledLegPrice + s.fillPrice;
+                logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} market-sold ${remainingShares.toFixed(3)} sh @ $${s.fillPrice.toFixed(3)} | combined $${combined.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+                return;
+            }
+
             if (currentPrice >= minAdaptivePrice) {
                 logger.info(`MM adaptive CL: placing limit sell @ $${targetPrice.toFixed(3)} (mid: $${currentPrice.toFixed(3)}, combined: $${(filledLegPrice + targetPrice).toFixed(3)}, ${Math.round(msLeft / 1000)}s left)`);
-                const result = await placeLimitSell(s.tokenId, sellShares, targetPrice, tickSize, negRisk);
+                const result = await placeLimitSell(s.tokenId, remainingShares, targetPrice, tickSize, negRisk);
                 if (result.success) {
                     activeOrderId    = result.orderId;
                     activeLimitPrice = targetPrice;
@@ -426,12 +488,24 @@ async function adaptiveLegCL(pos, unfilledKey) {
     }
 
     // ── Fallback: market sell at CL time ───────────────────────────────────────
-    logger.warn(`MM adaptive CL: CL time reached — market-selling ${sellShares.toFixed(3)} ${unfilledKey.toUpperCase()} shares`);
-    const result   = await marketSell(s.tokenId, sellShares, tickSize, negRisk);
+    // Re-check actual balance before market sell (partial fills may have occurred)
+    const finalBalance = await getTokenBalance(s.tokenId);
+    const finalShares  = finalBalance !== null ? finalBalance : sellShares;
+
+    if (finalShares < 0.001) {
+        logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} balance is 0 at CL time — already fully sold`);
+        s.fillPrice = config.mmSellPrice;
+        s.filled    = true;
+        pos.status  = 'done';
+        return;
+    }
+
+    logger.warn(`MM adaptive CL: CL time reached — market-selling ${finalShares.toFixed(3)} ${unfilledKey.toUpperCase()} shares`);
+    const result   = await marketSell(s.tokenId, finalShares, tickSize, negRisk);
     s.fillPrice    = result.fillPrice;
-    const pnl      = (s.fillPrice - s.entryPrice) * sellShares;
+    const pnl      = (s.fillPrice - s.entryPrice) * finalShares;
     const combined = filledLegPrice + s.fillPrice;
-    logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} market-sold @ $${s.fillPrice.toFixed(3)} | combined $${combined.toFixed(3)} | sold ${sellShares.toFixed(3)} sh | P&L $${pnl.toFixed(2)}`);
+    logger.warn(`MM adaptive CL: ${unfilledKey.toUpperCase()} market-sold @ $${s.fillPrice.toFixed(3)} | combined $${combined.toFixed(3)} | sold ${finalShares.toFixed(3)} sh | P&L $${pnl.toFixed(2)}`);
 
     s.filled   = true;
     pos.status = 'done';
@@ -626,10 +700,12 @@ export async function executeMMStrategy(market) {
     const entryPrice = 0.50;
     logger.info(`MM${tag}: split done — ${shares} YES + ${shares} NO @ $${entryPrice}`);
 
-    // ── Place limit sells ───────────────────────────────────────
+    // ── Place limit sells (parallel) ────────────────────────────
     logger.info(`MM${tag}: ${sim}placing limit sells @ $${config.mmSellPrice}`);
-    const yesSell = await placeLimitSell(yesTokenId, shares, config.mmSellPrice, tickSize, negRisk);
-    const noSell = await placeLimitSell(noTokenId, shares, config.mmSellPrice, tickSize, negRisk);
+    const [yesSell, noSell] = await Promise.all([
+        placeLimitSell(yesTokenId, shares, config.mmSellPrice, tickSize, negRisk),
+        placeLimitSell(noTokenId, shares, config.mmSellPrice, tickSize, negRisk),
+    ]);
 
     if (!yesSell.success || !noSell.success) {
         logger.error(`MM${tag}: failed to place limit sells — cutting immediately`);

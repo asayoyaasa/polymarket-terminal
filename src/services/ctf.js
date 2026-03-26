@@ -101,14 +101,44 @@ const RETRY_DELAY = 3000; // ms
 // tx waits for the previous one to fully confirm before starting.
 let _txQueue = Promise.resolve();
 
+// Track whether a strategy (split/merge) tx is in progress so the redeemer can defer
+let _strategyTxActive = false;
+
 /**
  * Execute an arbitrary call through the Gnosis Safe proxy wallet.
  * Calls are serialized via an internal queue so nonces never collide.
  * Retries up to MAX_RETRIES times on transient errors.
+ *
+ * @param {string}  to          - Contract address
+ * @param {string}  data        - Encoded calldata
+ * @param {string}  description - Human-readable label for logging
+ * @param {object}  [opts]      - Options
+ * @param {boolean} [opts.priority=true] - Priority calls (strategy split/merge) run immediately.
+ *                                         Non-priority calls (redeemer) wait until no strategy tx is active.
  */
-export function execSafeCall(to, data, description = '') {
+export function execSafeCall(to, data, description = '', opts = {}) {
+    const { priority = true } = opts;
+
+    const job = async () => {
+        // Non-priority (redeemer): wait if a strategy tx is active
+        if (!priority && _strategyTxActive) {
+            logger.info(`MM: deferring non-priority tx (${description}) — strategy tx in progress`);
+            // Wait until strategy tx finishes (poll every 1s, max 60s)
+            for (let i = 0; i < 60 && _strategyTxActive; i++) {
+                await sleep(1000);
+            }
+        }
+
+        if (priority) _strategyTxActive = true;
+        try {
+            return await _doExecSafeCall(to, data, description);
+        } finally {
+            if (priority) _strategyTxActive = false;
+        }
+    };
+
     // Enqueue: this call will only start after the previous one resolves/rejects
-    const result = _txQueue.then(() => _doExecSafeCall(to, data, description));
+    const result = _txQueue.then(job);
     // Don't let a failure poison the queue for subsequent calls
     _txQueue = result.catch(() => { });
     return result;
@@ -208,18 +238,28 @@ async function _doExecSafeCall(to, data, description = '') {
 
 // ── Approval helpers ──────────────────────────────────────────────────────────
 
+// In-memory approval cache — avoids redundant on-chain reads after first approval
+let _usdcApproved = false;
+const _exchangeApproved = new Set(); // exchange addresses already confirmed
+
 /**
  * Ensure the CTF contract can spend USDC from the proxy wallet.
  */
 async function ensureUsdcApproval(amountWei) {
+    if (_usdcApproved) return;
+
     const provider = await getPolygonProvider();
     const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
     const allowance = await usdc.allowance(config.proxyWallet, CTF_ADDRESS);
-    if (allowance.gte(amountWei)) return;
+    if (allowance.gte(amountWei)) {
+        _usdcApproved = true;
+        return;
+    }
 
     const iface = new ethers.utils.Interface(ERC20_ABI);
     const data = iface.encodeFunctionData('approve', [CTF_ADDRESS, ethers.constants.MaxUint256]);
     await execSafeCall(USDC_ADDRESS, data, 'approve USDC → CTF');
+    _usdcApproved = true;
     logger.success('MM: USDC approved to CTF contract');
 }
 
@@ -229,15 +269,21 @@ async function ensureUsdcApproval(amountWei) {
  */
 export async function ensureExchangeApproval(negRisk = false) {
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE;
+    if (_exchangeApproved.has(exchange)) return;
+
     const provider = await getPolygonProvider();
     const ctf = new ethers.Contract(CTF_ADDRESS, ERC1155_ABI, provider);
 
     const approved = await ctf.isApprovedForAll(config.proxyWallet, exchange);
-    if (approved) return;
+    if (approved) {
+        _exchangeApproved.add(exchange);
+        return;
+    }
 
     const iface = new ethers.utils.Interface(ERC1155_ABI);
     const data = iface.encodeFunctionData('setApprovalForAll', [exchange, true]);
     await execSafeCall(CTF_ADDRESS, data, 'setApprovalForAll → CTF Exchange');
+    _exchangeApproved.add(exchange);
     logger.success(`MM: CTF exchange approved as ERC1155 operator`);
 }
 
@@ -523,7 +569,7 @@ export async function redeemMMPositions() {
                 conditionId,
                 [1, 2],
             ]);
-            await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
+            await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`, { priority: false });
             logger.money(`MM redeemer: redeemed ${label} → ~$${expectedUsdc.toFixed(2)} USDC`);
             redeemed++;
         } catch (err) {
@@ -704,7 +750,7 @@ export async function redeemSniperPositions() {
                 conditionId,
                 [1, 2],
             ]);
-            const receipt = await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`);
+            const receipt = await execSafeCall(CTF_ADDRESS, data, `redeemPositions ${label}`, { priority: false });
 
             logger.money(`SNIPER redeemer: redeemed ${label} → ~$${expectedUsdc.toFixed(2)} USDC ✅ | tx: ${receipt.transactionHash}`);
             redeemed++;
