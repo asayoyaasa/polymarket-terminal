@@ -343,7 +343,7 @@ async function cutLossNeitherFilled(pos) {
  *
  * Strategy:
  *   1. Cancel both limit sells, keep monitoring
- *   2. Wait until 30s before close
+ *   2. Wait until 45s before close
  *   3. Check prices: identify worst (lower price) and best (higher price) side
  *   4. If worst < MM_DEFENSIVE_WORST_THRESHOLD (default 10c):
  *        → market sell worst side, keep best side (let it resolve at close)
@@ -358,13 +358,13 @@ async function defensivePivot(pos) {
     // Cancel both limit sells immediately — we'll decide at 30s mark
     await cancelOrder(pos.yes.orderId);
     await cancelOrder(pos.no.orderId);
-    logger.info(`MM defensive: cancelled both limit sells — waiting for 30s before close | ${label}`);
+    logger.info(`MM defensive: cancelled both limit sells — waiting for 45s before close | ${label}`);
 
     // Wait until 30s before close, checking every 5s if one side fills via partial
     while (true) {
         const msLeft = new Date(pos.endTime).getTime() - Date.now();
 
-        if (msLeft <= 30_000) break; // 30s mark reached
+        if (msLeft <= 45_000) break; // 45s mark reached
         if (msLeft <= 0) {
             pos.status = 'expired';
             return;
@@ -379,7 +379,7 @@ async function defensivePivot(pos) {
         getMidprice(pos.no.tokenId),
     ]);
 
-    logger.info(`MM defensive: 30s mark — YES=$${yesPrice.toFixed(3)}, NO=$${noPrice.toFixed(3)} | threshold=$${threshold} | ${label}`);
+    logger.info(`MM defensive: 45s mark — YES=$${yesPrice.toFixed(3)}, NO=$${noPrice.toFixed(3)} | threshold=$${threshold} | ${label}`);
 
     // Determine worst and best sides
     const worstKey = yesPrice <= noPrice ? 'yes' : 'no';
