@@ -39,6 +39,18 @@ export async function setupAxiosProxy() {
         axios.defaults.proxy = false;
         axios.defaults.httpAgent = axiosAgent;
         axios.defaults.httpsAgent = axiosAgent;
+
+        // Add request interceptor to force proxy agent on every request
+        // This catches cases where axios.create() instances ignore defaults
+        axios.interceptors.request.use((cfg) => {
+            if (cfg.url && cfg.url.includes('polymarket.com')) {
+                cfg.httpsAgent = axiosAgent;
+                cfg.httpAgent = axiosAgent;
+                cfg.proxy = false;
+            }
+            return cfg;
+        });
+
         logger.info(`Axios proxy configured → ${maskProxyUrl(config.proxyUrl)}`);
     } catch (err) {
         logger.error(`Failed to configure axios proxy: ${err.message}`);
@@ -115,12 +127,12 @@ export async function testProxy() {
     // Show both IPs so user can verify which IP Polymarket sees
     await checkOutboundIP();
 
+    // ── Test 1: fetch (undici) ──────────────────────────────────────────
     try {
         if (!fetchDispatcher) {
             throw new Error('Proxy dispatcher not initialized');
         }
 
-        // Test with a simple GET to the CLOB time endpoint via proxied fetch
         const resp = await fetch(`${config.clobHost}/time`, {
             dispatcher: fetchDispatcher,
             signal: AbortSignal.timeout(15000),
@@ -146,13 +158,54 @@ export async function testProxy() {
             throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
         }
 
-        logger.success(`Proxy test passed — connected via ${maskProxyUrl(config.proxyUrl)}`);
-        return true;
+        logger.success(`Proxy test (fetch) passed`);
     } catch (err) {
-        logger.error(`Proxy test FAILED: ${err.message}`);
+        logger.error(`Proxy test (fetch) FAILED: ${err.message}`);
         logger.error('Check PROXY_URL in .env. Bot cannot reach Polymarket without a working proxy.');
         return false;
     }
+
+    // ── Test 2: axios (same transport as CLOB client) ────────────────────
+    try {
+        if (!axiosAgent) {
+            throw new Error('Axios proxy agent not initialized');
+        }
+
+        const axiosModule = await import('axios');
+        const axios = axiosModule.default || axiosModule;
+        const axiosResp = await axios.get(`${config.clobHost}/time`, {
+            httpsAgent: axiosAgent,
+            proxy: false,
+            timeout: 15000,
+        });
+
+        logger.success(`Proxy test (axios) passed`);
+    } catch (err) {
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+
+        if (status === 403) {
+            const body = typeof data === 'string' ? data : JSON.stringify(data || '');
+            const isGeoblock = body.includes('restricted') || body.includes('region') || body.includes('geoblock');
+            if (isGeoblock) {
+                logger.error('═══════════════════════════════════════════════════');
+                logger.error('GEOBLOCKED (axios) — Polymarket CLOB rejected your proxy IP!');
+                logger.error('Your proxy IP is in a restricted region.');
+                logger.error('The CLOB client uses axios — this test confirms proxy routing.');
+                logger.error('Change PROXY_URL in .env to a proxy in an allowed region.');
+                logger.error('═══════════════════════════════════════════════════');
+            } else {
+                logger.error(`CLOB returned 403 via axios: ${body.substring(0, 200)}`);
+            }
+            return false;
+        }
+
+        logger.error(`Proxy test (axios) FAILED: ${err.message}`);
+        return false;
+    }
+
+    logger.success(`All proxy tests passed — connected via ${maskProxyUrl(config.proxyUrl)}`);
+    return true;
 }
 
 /**
