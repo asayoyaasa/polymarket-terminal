@@ -79,12 +79,21 @@ if (!inserted) {
     process.exit(0);
 }
 
-// ── Step 2: Patch the request config to inject proxy agent ──────────────────
+// ── Step 2: Patch the request function to inject proxy agent ────────────────
 
-// Match: const config = { method, url: endpoint, headers, data, params }
-// with any whitespace variation (spaces, newlines, tabs)
-const configRegex = /const\s+config\s*=\s*\{\s*method\s*,\s*url\s*:\s*endpoint\s*,\s*headers\s*,\s*data\s*,\s*params\s*\}\s*;/;
+// The compiled code can have two formats:
+//
+// Format A (some versions): uses a `config` variable
+//   const config = { method, url: endpoint, headers, data, params };
+//   ... axios_1.default(config) ...
+//
+// Format B (VPS/fresh install): inline object passed to axios
+//   return yield (0, axios_1.default)({ method, url: endpoint, headers, data, params });
 
+let patched = false;
+
+// ── Try Format A: explicit config variable ──────────────────────────────────
+const configRegex = /(?:const|let|var)\s+config\s*=\s*\{\s*method\s*,\s*url\s*:\s*endpoint\s*,\s*headers\s*,\s*data\s*,\s*params\s*\}\s*;/;
 const configMatch = code.match(configRegex);
 
 if (configMatch) {
@@ -98,49 +107,57 @@ if (configMatch) {
         }
     }`;
     code = code.replace(configMatch[0], PROXY_INJECT);
-    console.log('[patch] Injected proxy agent into request config');
-} else {
-    // Fallback: try to find any config object creation with method/endpoint
-    // and inject proxy after it
-    const fallbackRegex = /(?:const|let|var)\s+config\s*=\s*\{[^}]*method[^}]*endpoint[^}]*\}\s*;/;
-    const fallbackMatch = code.match(fallbackRegex);
+    console.log('[patch] Injected proxy agent into request config (Format A)');
+    patched = true;
+}
 
-    if (fallbackMatch) {
-        const PROXY_INJECT = `${fallbackMatch[0]}
-    // Add proxy agent for Polymarket API
-    if (endpoint && endpoint.includes('polymarket.com')) {
-        const agent = getProxyAgent();
-        if (agent) {
-            config.httpsAgent = agent;
-            config.proxy = false;
-        }
-    }`;
-        code = code.replace(fallbackMatch[0], PROXY_INJECT);
-        console.log('[patch] Injected proxy agent into request config (fallback match)');
-    } else {
-        // Last resort: find the axios request/call and inject before it
-        const axiosCallRegex = /axios_1\.default\s*\(\s*config\s*\)/;
-        const axiosMatch = code.match(axiosCallRegex);
+// ── Try Format B: inline axios call with object literal ─────────────────────
+// Matches: (0, axios_1.default)({ method, url: endpoint, headers, data, params })
+// or:      axios_1.default({ method, url: endpoint, headers, data, params })
+if (!patched) {
+    const inlineRegex = /(\(0,\s*axios_1\.default\)\s*\(\s*)\{\s*method\s*,\s*url\s*:\s*endpoint\s*,\s*headers\s*,\s*data\s*,\s*params\s*\}/;
+    const inlineMatch = code.match(inlineRegex);
 
-        if (axiosMatch) {
-            const PROXY_INJECT = `// Add proxy agent for Polymarket API
-    if (config.url && config.url.includes('polymarket.com')) {
-        const agent = getProxyAgent();
-        if (agent) {
-            config.httpsAgent = agent;
-            config.proxy = false;
-        }
+    if (inlineMatch) {
+        // Replace the inline object with a function that builds + injects proxy
+        const replacement = `(() => { const _cfg = { method, url: endpoint, headers, data, params }; const _agent = getProxyAgent(); if (_agent && endpoint && endpoint.includes('polymarket.com')) { _cfg.httpsAgent = _agent; _cfg.proxy = false; } return _cfg; })()`;
+        // Replace just the object literal part: { method, url: endpoint, ... }
+        // Keep the (0, axios_1.default)( prefix
+        code = code.replace(inlineMatch[0], inlineMatch[1] + replacement);
+        console.log('[patch] Injected proxy agent into inline axios call (Format B)');
+        patched = true;
     }
-    ${axiosMatch[0]}`;
-            code = code.replace(axiosMatch[0], PROXY_INJECT);
-            console.log('[patch] Injected proxy agent before axios call (last resort)');
-        } else {
-            console.error('[patch] Could not find request config or axios call — skipping');
-            console.error('[patch] File content preview (first 2000 chars):');
-            console.error(code.substring(0, 2000));
-            process.exit(0);
+}
+
+// ── Try Format C: any axios call with config object ─────────────────────────
+if (!patched) {
+    const axiosCallRegex = /axios_1\.default\s*\(\s*\{\s*method/;
+    const axiosMatch = code.match(axiosCallRegex);
+
+    if (axiosMatch) {
+        // Find the full object literal by counting braces
+        const startIdx = code.indexOf(axiosMatch[0]);
+        const braceStart = code.indexOf('{', startIdx);
+        let depth = 0;
+        let braceEnd = braceStart;
+        for (let i = braceStart; i < code.length; i++) {
+            if (code[i] === '{') depth++;
+            if (code[i] === '}') depth--;
+            if (depth === 0) { braceEnd = i; break; }
         }
+        const objectLiteral = code.substring(braceStart, braceEnd + 1);
+        const replacement = `(() => { const _cfg = ${objectLiteral}; const _agent = getProxyAgent(); if (_agent && _cfg.url && _cfg.url.includes('polymarket.com')) { _cfg.httpsAgent = _agent; _cfg.proxy = false; } return _cfg; })()`;
+        code = code.substring(0, braceStart) + replacement + code.substring(braceEnd + 1);
+        console.log('[patch] Injected proxy agent via brace-matching (Format C)');
+        patched = true;
     }
+}
+
+if (!patched) {
+    console.error('[patch] Could not find request config or axios call — skipping');
+    console.error('[patch] File content preview (first 2000 chars):');
+    console.error(code.substring(0, 2000));
+    process.exit(0);
 }
 
 fs.writeFileSync(TARGET, code, 'utf8');
