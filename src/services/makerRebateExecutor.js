@@ -649,7 +649,7 @@ export async function executeMakerRebateStrategy(market) {
             continue;
         }
 
-        combined = yesBid + noBid;
+        combined = parseFloat((yesBid + noBid).toFixed(4));
 
         if (combined > config.makerMmMaxCombined) {
             logger.info(`MakerMM${tag}: combined $${combined.toFixed(4)} > max — waiting`);

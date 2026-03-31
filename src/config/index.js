@@ -96,6 +96,7 @@ const config = {
   makerMmEntryWindow: parseInt(process.env.MAKER_MM_ENTRY_WINDOW || '45', 10),  // max secs after open to enter
   makerMmPollInterval: parseInt(process.env.MAKER_MM_POLL_INTERVAL || process.env.MM_POLL_INTERVAL || '5', 10) * 1000,
   makerMmReentryDelay: parseInt(process.env.MAKER_MM_REENTRY_DELAY || '30', 10) * 1000, // ms delay between re-entry cycles
+  makerMmReentryEnabled: process.env.MAKER_MM_REENTRY_ENABLED !== 'false', // set false to disable re-entry (one cycle per market)
   makerMmRepriceThreshold: parseFloat(process.env.MAKER_MM_REPRICE_THRESHOLD || '0.02'), // reprice if bid drifts > this (default 2c)
   makerMmMinPrice: parseFloat(process.env.MAKER_MM_MIN_PRICE || '0.30'),   // min bid for rebate range (both sides)
   makerMmMaxPrice: parseFloat(process.env.MAKER_MM_MAX_PRICE || '0.69'),   // max bid for rebate range (both sides)

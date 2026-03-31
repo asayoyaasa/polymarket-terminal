@@ -182,7 +182,7 @@ async function runStrategy(market) {
         const secsLeft = Math.round(msRemaining / 1000);
         const minTimeForReentry = 180; // 3 minutes minimum
 
-        if (secsLeft > config.makerMmCutLossTime + minTimeForReentry) {
+        if (config.makerMmReentryEnabled && secsLeft > config.makerMmCutLossTime + minTimeForReentry) {
             // ── CURRENT MARKET: Check odds before re-entry ──────────────────────
             if (isCurrentMarket && config.currentMarketEnabled) {
                 const oddsValid = await isCurrentMarketOddsValidForReentry(
