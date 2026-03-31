@@ -75,145 +75,6 @@ async function getBestAsk(tokenId) {
 }
 
 // ── Bid-based repricing ───────────────────────────────────────────────────────
-// Targets top of bid orderbook: newBid = bestBid + 1 tick (become new top bid).
-// Safety cap: newBid < bestAsk (guaranteed maker by construction).
-// Only reprices when bid drifts > config.makerMmRepriceThreshold (default 2c).
-// If one side is already filled, the other side is capped so combined never exceeds target.
-async function checkAndReprice(pos, tag) {
-    const threshold = config.makerMmRepriceThreshold;
-    const ts = parseFloat(pos.tickSize);
-    const MIN_PRICE = getMinPrice();
-    const MAX_PRICE = getMaxPrice();
-    const oneSideFilled = pos.yes.filled !== pos.no.filled;
-    const timeSinceFirstFill = pos.firstFillTime ? Date.now() - pos.firstFillTime : 0;
-    if (oneSideFilled) {
-        logger.info(`MakerMM${tag}: ${pos.yes.filled ? 'YES' : 'NO'} filled — holding bid, waiting for reversion (${Math.round(timeSinceFirstFill / 1000)}s)`);
-        return; // Never reprice when one side is already filled — prevent double exposure
-    }
-
-    const repriceSide = async (side) => {
-        const s = pos[side];
-        if (s.filled) return;
-
-        // Bid-based: target = bestBid + 1 tick (top of bid orderbook)
-        // Fetch both bid and ask in parallel — ask used as safety cap only
-        const [bestBid, bestAsk] = await Promise.all([
-            getRealPrice(s.tokenId),
-            getBestAsk(s.tokenId),
-        ]);
-        if (!bestBid) return; // no bid data — skip
-
-        let newBid = roundToTick(bestBid + ts, pos.tickSize);
-
-        // Safety: never cross the ask (guaranteed maker)
-        if (bestAsk && newBid >= bestAsk) {
-            newBid = roundToTick(bestAsk - ts, pos.tickSize);
-        }
-
-        // Drift check: compare current bestBid vs entryBid (set once on first reprice)
-        // entryBid = buyPrice - ts (since buyPrice = bestBid + ts at entry)
-        const entryBid = s.entryBid ?? (s.buyPrice - ts);
-        const bidDrift = Math.abs(bestBid - entryBid);
-        if (bidDrift <= threshold) return;
-
-        // Rebate range cap
-        newBid = Math.min(newBid, MAX_PRICE);
-
-        // Combined cap always enforced — never allow combined to exceed maxCombined
-        const otherBid = side === 'yes' ? pos.no.buyPrice : pos.yes.buyPrice;
-        const maxBid = roundToTick(config.makerMmMaxCombined - otherBid, pos.tickSize);
-        newBid = Math.min(newBid, maxBid);
-
-        if (newBid < MIN_PRICE) {
-            logger.info(`MakerMM${tag}: ${side.toUpperCase()} new bid $${newBid} < MIN_PRICE — skip reprice`);
-            return;
-        }
-        if (Math.abs(newBid - s.buyPrice) < ts) return; // no meaningful change after caps
-
-        logger.info(
-            `MakerMM${tag}: repricing ${side.toUpperCase()} $${s.buyPrice} → $${newBid} ` +
-            `(bid drift ${(bidDrift * 100).toFixed(0)}c > ${(threshold * 100).toFixed(0)}c threshold)`
-        );
-
-        // Re-check filled status — WS fill may have arrived during the async API calls above
-        if (s.filled) {
-            logger.money(`MakerMM${tag}: ${side.toUpperCase()} filled during reprice check — skipping cancel`);
-            if (!pos.firstFillTime) pos.firstFillTime = Date.now();
-            return;
-        }
-
-        const oldOrderId = s.orderId;
-        const cancelled = await cancelOrder(oldOrderId);
-
-        // Wait 1500ms — matching engine can take up to 5s to settle a fill after
-        // the API acknowledges a cancel. 300ms is too short to catch most races.
-        await sleep(1500);
-        const oldStatus = await checkOrderStatus(oldOrderId);
-        if (oldStatus === 'filled' || oldStatus === 'partial') {
-            logger.money(`MakerMM${tag}: ${side.toUpperCase()} filled during reprice cancel (status: ${oldStatus}) — skipping new order`);
-            s.filled = true;
-            if (!pos.firstFillTime) pos.firstFillTime = Date.now();
-            return;
-        }
-        if (!cancelled) {
-            logger.warn(`MakerMM${tag}: reprice ${side.toUpperCase()} — cancel failed (status: ${oldStatus}), skipping to avoid duplicate`);
-            return;
-        }
-
-        // Final WS-fill check before placing new order
-        if (s.filled) {
-            logger.money(`MakerMM${tag}: ${side.toUpperCase()} filled while verifying cancel — skipping new order`);
-            if (!pos.firstFillTime) pos.firstFillTime = Date.now();
-            return;
-        }
-
-        const orderShares = pos.targetShares;
-
-        const result = await placeLimitBuy(s.tokenId, orderShares, newBid, pos.tickSize, pos.negRisk);
-        if (result.success) {
-            // One last check: if old order filled while we were placing the new one, cancel it immediately
-            if (s.filled) {
-                logger.warn(`MakerMM${tag}: ${side.toUpperCase()} old order filled while placing new — cancelling new order to prevent double fill`);
-                await cancelOrder(result.orderId);
-                return;
-            }
-            const newOrderId = result.orderId;
-            s.orderId = newOrderId;
-            s.buyPrice = newBid;
-            s.cost = orderShares * newBid;
-            s.orderShares = orderShares; // may differ from targetShares when loss-compensating
-            // Track entryBid once — never update so drift tracks from original entry
-            if (!s.entryBid) s.entryBid = entryBid;
-
-            // Background: matching engine may still fill the old order up to ~6s post-cancel.
-            // If that happens, cancel the new order immediately to prevent double-fill.
-            setTimeout(async () => {
-                try {
-                    if (s.orderId !== newOrderId) return; // already repriced again — skip
-                    const delayedStatus = await checkOrderStatus(oldOrderId);
-                    if (delayedStatus === 'filled' || delayedStatus === 'partial') {
-                        logger.warn(
-                            `MakerMM${tag}: delayed fill on cancelled ${side.toUpperCase()} order — ` +
-                            `cancelling new order ${newOrderId.slice(-8)} to prevent double-fill`
-                        );
-                        if (!s.filled) {
-                            s.filled = true;
-                            if (!pos.firstFillTime) pos.firstFillTime = Date.now();
-                        }
-                        await cancelOrder(newOrderId);
-                    }
-                } catch {}
-            }, 5000);
-        } else {
-            logger.warn(`MakerMM${tag}: reprice ${side.toUpperCase()} failed — order not replaced`);
-        }
-    };
-
-    // Sequential: recheck filled status before each side in case WS fill arrived mid-reprice
-    await repriceSide('yes');
-    if (!pos.no.filled) await repriceSide('no');
-}
-
 // ── Get current market odds ──────────────────────────────────────────────────
 async function getMarketOdds(yesTokenId, noTokenId) {
     try {
@@ -262,6 +123,110 @@ async function checkOrderStatus(orderId) {
         logger.debug(`MakerMM: order status check failed for ${orderId?.slice(-8)} — ${err.message}`);
     }
     return 'unknown';
+}
+
+// ── Market sell ───────────────────────────────────────────────────────────────
+// Verifies onchain balance after each attempt — CLOB fill confirmation alone is
+// not enough because sells can also be ghost-filled (CLOB says done, txhash invalid,
+// shares still in wallet). Retries up to 3 times with onchain verification.
+async function marketSellToken(tokenId, shares, tickSize, negRisk, tag) {
+    if (config.dryRun) {
+        logger.info(`MakerMM${tag}: [SIM] would market-sell ${shares.toFixed(4)} shares of token ${tokenId.slice(-8)}`);
+        return true;
+    }
+
+    const client = getClient();
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Snapshot balance before sell — source of truth for whether it went through
+        const balanceBefore = (await getTokenBalance(tokenId)) ?? 0;
+        if (balanceBefore < 0.01) {
+            logger.info(`MakerMM${tag}: sell skipped — balance already 0`);
+            return true;
+        }
+
+        const sharesToSell = Math.min(shares, balanceBefore);
+
+        let refPrice = 0.01;
+        try {
+            const bidResult = await client.getPrice(tokenId, 'BUY');
+            const bid = parseFloat(bidResult?.price ?? bidResult ?? '0');
+            if (bid > 0) refPrice = Math.max(bid * 0.97, 0.01);
+        } catch {}
+
+        try {
+            const response = await client.createAndPostMarketOrder(
+                { tokenID: tokenId, side: Side.SELL, amount: sharesToSell, price: refPrice },
+                { tickSize, negRisk },
+                OrderType.FAK,
+            );
+
+            if (!response?.success || parseFloat(response?.takingAmount || '0') === 0) {
+                logger.warn(`MakerMM${tag}: sell attempt ${attempt}/${maxAttempts} — CLOB rejected (${response?.errorMsg || 'no liquidity'})`);
+                await sleep(3000);
+                continue;
+            }
+
+            // CLOB says filled — wait then verify onchain balance actually decreased
+            await sleep(8000);
+            const balanceAfter = (await getTokenBalance(tokenId)) ?? balanceBefore;
+            const sold = balanceBefore - balanceAfter;
+
+            if (sold >= sharesToSell * 0.5) {
+                logger.money(`MakerMM${tag}: sold ${sold.toFixed(4)} shares @ ~$${refPrice.toFixed(3)} (attempt ${attempt})`);
+                return true;
+            }
+
+            // Balance unchanged → ghost sell, retry
+            logger.warn(`MakerMM${tag}: sell attempt ${attempt}/${maxAttempts} ghost — CLOB filled but ${balanceAfter.toFixed(4)} shares still onchain, retrying...`);
+            await sleep(5000 * attempt);
+
+        } catch (err) {
+            logger.error(`MakerMM${tag}: sell attempt ${attempt}/${maxAttempts} error — ${err.message}`);
+            await sleep(3000);
+        }
+    }
+
+    logger.warn(`MakerMM${tag}: sell failed after ${maxAttempts} attempts — shares remain in wallet (will resolve at market close)`);
+    return false;
+}
+
+// ── Ghost fill recovery ───────────────────────────────────────────────────────
+// Onchain balance doesn't match what CLOB says was filled (partial or full ghost).
+// Strategy: merge whatever paired shares exist, then market-sell any unpaired remainder.
+// Handles all partial amounts — caller passes actual onchain balances.
+async function recoverFromGhostFill(pos, yesShares, noShares, tag) {
+    logger.warn(
+        `MakerMM${tag}: ghost fill recovery — onchain YES=${yesShares.toFixed(4)} NO=${noShares.toFixed(4)} ` +
+        `(expected ${pos.targetShares} each)`
+    );
+
+    const mergeable = Math.floor(Math.min(yesShares, noShares) * 10000) / 10000;
+    let mergeRecovered = 0;
+
+    if (mergeable >= 1) {
+        try {
+            await mergePositions(pos.conditionId, mergeable, pos.negRisk);
+            mergeRecovered = mergeable;
+            logger.money(`MakerMM${tag}: ghost recovery merge ${mergeable.toFixed(4)} pairs → $${mergeRecovered.toFixed(2)}`);
+        } catch (err) {
+            logger.error(`MakerMM${tag}: ghost recovery merge failed — ${err.message}`);
+        }
+    }
+
+    const yesRemainder = parseFloat(Math.max(0, yesShares - mergeable).toFixed(6));
+    const noRemainder  = parseFloat(Math.max(0, noShares  - mergeable).toFixed(6));
+
+    if (yesRemainder >= 1) {
+        await marketSellToken(pos.yes.tokenId, yesRemainder, pos.tickSize, pos.negRisk, tag);
+    }
+    if (noRemainder >= 1) {
+        await marketSellToken(pos.no.tokenId, noRemainder, pos.tickSize, pos.negRisk, tag);
+    }
+
+    pos.totalProfit = mergeRecovered - (pos.yes.cost + pos.no.cost);
+    pos.status = 'done';
 }
 
 async function placeLimitBuy(tokenId, shares, price, tickSize, negRisk) {
@@ -356,7 +321,6 @@ async function monitorUntilFilled(pos, tag, label) {
     try {
         let fastFillCheckCount = 0;
         const maxFastChecks = 10; // 1s polling for first 10s
-        let lastRepriceCheck = 0; // track last reprice attempt time
 
         while (true) {
             // Safety guard: exit immediately if resolved by any path
@@ -377,16 +341,12 @@ async function monitorUntilFilled(pos, tag, label) {
             const yesShares = parseFloat(Math.max(0, (yesBal || 0) - pos.yes.baseline).toFixed(6));
             const noShares = parseFloat(Math.max(0, (noBal || 0) - pos.no.baseline).toFixed(6));
 
-            // Sync fill flags from onchain (overrides any stale WS flag).
-            // Use s.orderShares if set (loss-compensating reprice may order > targetShares),
-            // so we wait for the actual order size to fill, not just targetShares.
-            const yesOrderShares = pos.yes.orderShares ?? pos.targetShares;
-            const noOrderShares  = pos.no.orderShares  ?? pos.targetShares;
-            if (!pos.yes.filled && yesShares >= yesOrderShares * 0.99) {
+            // Sync fill flags from onchain (source of truth)
+            if (!pos.yes.filled && yesShares >= pos.targetShares * 0.99) {
                 pos.yes.filled = true;
                 logger.money(`MakerMM${tag}: YES filled (onchain) ${yesShares.toFixed(4)} shares`);
             }
-            if (!pos.no.filled && noShares >= noOrderShares * 0.99) {
+            if (!pos.no.filled && noShares >= pos.targetShares * 0.99) {
                 pos.no.filled = true;
                 logger.money(`MakerMM${tag}: NO filled (onchain) ${noShares.toFixed(4)} shares`);
             }
@@ -406,6 +366,64 @@ async function monitorUntilFilled(pos, tag, label) {
                 await cancelOrder(pos.no.orderId);
                 pos.no.filled = true;
                 if (!pos.firstFillTime) pos.firstFillTime = Date.now();
+            }
+
+            // ── Ghost fill detection via open orders check ────────────────────────
+            // More reliable than checkOrderStatus(orderId) which can return 'unknown'
+            // for ghost fills (invalid txhash → CLOB state is inconsistent).
+            // If our order is gone from open orders but onchain balance didn't increase
+            // → order was matched in CLOB but settlement failed (ghost fill).
+            {
+                const nowMs = Date.now();
+                const client = getClient();
+
+                if (!pos.yes.filled && !pos.yes.clobFilled && pos.yes.orderId && nowMs - (pos.yes.lastClobCheck || 0) >= 15_000) {
+                    pos.yes.lastClobCheck = nowMs;
+                    try {
+                        const openOrders = await client.getOpenOrders({ asset_id: pos.yes.tokenId });
+                        const stillOpen = Array.isArray(openOrders) && openOrders.some(o => (o.id ?? o.order_id) === pos.yes.orderId);
+                        if (!stillOpen) {
+                            pos.yes.clobFilled = true;
+                            logger.info(`MakerMM${tag}: YES order gone from CLOB open orders (onchain not yet reflected)`);
+                        }
+                    } catch {}
+                }
+                if (!pos.no.filled && !pos.no.clobFilled && pos.no.orderId && nowMs - (pos.no.lastClobCheck || 0) >= 15_000) {
+                    pos.no.lastClobCheck = nowMs;
+                    try {
+                        const openOrders = await client.getOpenOrders({ asset_id: pos.no.tokenId });
+                        const stillOpen = Array.isArray(openOrders) && openOrders.some(o => (o.id ?? o.order_id) === pos.no.orderId);
+                        if (!stillOpen) {
+                            pos.no.clobFilled = true;
+                            logger.info(`MakerMM${tag}: NO order gone from CLOB open orders (onchain not yet reflected)`);
+                        }
+                    } catch {}
+                }
+
+                // Ghost fill detection:
+                // CLOB says order is FILLED but onchain balance < expected after timeout.
+                // Could be full ghost (0 tokens) or partial (some tokens, but not all).
+                // Trigger: either side clobFilled AND onchain short of target after 60s.
+                const yesGhost = pos.yes.clobFilled && yesShares < pos.targetShares * 0.99;
+                const noGhost  = pos.no.clobFilled  && noShares  < pos.targetShares * 0.99;
+
+                if (yesGhost || noGhost) {
+                    if (!pos.ghostFillSince) pos.ghostFillSince = nowMs;
+                    const waitedSec = Math.round((nowMs - pos.ghostFillSince) / 1000);
+                    if (waitedSec >= 30) {
+                        // 30s is enough to distinguish settlement delay from ghost fill.
+                        // Act now while market prices are still fair — don't wait for cut-loss.
+                        await recoverFromGhostFill(pos, yesShares, noShares, tag);
+                        return;
+                    } else {
+                        logger.info(
+                            `MakerMM${tag}: ghost fill suspected ` +
+                            `(YES CLOB=${pos.yes.clobFilled} onchain=${yesShares.toFixed(4)}, ` +
+                            `NO CLOB=${pos.no.clobFilled} onchain=${noShares.toFixed(4)}) ` +
+                            `— waiting ${waitedSec}s / 30s`
+                        );
+                    }
+                }
             }
 
             // ── WS fallback: both sides WS-confirmed filled but onchain RPC not reflecting ──
@@ -508,18 +526,6 @@ async function monitorUntilFilled(pos, tag, label) {
                             logger.info(`MakerMM${tag}: still waiting for ${filledKey === 'yes' ? 'NO' : 'YES'} — ${elapsedMin}m elapsed`);
                         }
                     }
-                }
-            }
-
-            // ── Threshold repricing ───────────────────────────────────────────
-            // Reprice unfilled side(s) only when price has drifted > threshold.
-            const repriceNow = Date.now();
-            if (
-                !pos.yes.filled || !pos.no.filled
-            ) {
-                if (repriceNow - lastRepriceCheck >= config.makerMmRepriceSec * 1000) {
-                    lastRepriceCheck = repriceNow;
-                    await checkAndReprice(pos, tag);
                 }
             }
 
@@ -803,8 +809,7 @@ export async function executeMakerRebateStrategy(market) {
             cost: yesCost,
             orderId: finalYesBuy.orderId,
             filled: false,
-            baseline: yesBaseline || 0, // pre-order balance — subtract to get net new fills
-            entryBid: yesEntryBid,      // bestBid at entry — for bid drift tracking
+            baseline: yesBaseline || 0,
         },
         no: {
             tokenId: noTokenId,
@@ -812,8 +817,7 @@ export async function executeMakerRebateStrategy(market) {
             cost: noCost,
             orderId: finalNoBuy.orderId,
             filled: false,
-            baseline: noBaseline || 0, // pre-order balance — subtract to get net new fills
-            entryBid: noEntryBid,      // bestBid at entry — for bid drift tracking
+            baseline: noBaseline || 0,
         },
         totalProfit: 0,
     };

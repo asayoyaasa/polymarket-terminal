@@ -21,10 +21,11 @@ High-frequency market-making on Polymarket's 15-minute BTC/ETH/SOL Up-or-Down ma
 5. Automatically queues the next market before the current one closes — zero idle time between markets
 
 **Key design decisions:**
-- **Never aggressive-reprices when one side is filled** — holds the original bid and waits for market reversion, preventing double exposure
+- **No repricing** — orders are placed once and held; no cancel/replace cycles that cause double orders or ghost fills
+- **Onchain balance as source of truth** — fill detection uses Polygon RPC balance, not CLOB API responses or WebSocket events alone
+- **Ghost fill recovery** — detects CLOB-matched orders with invalid txhash (order gone from book but tokens never arrived), recovers by merging what settled and selling remainder at market before prices skew
 - **Stops re-entry after a stuck (one-sided) cycle** — protects against accumulating directional exposure in trending markets
 - **Combined cap always enforced** — cost of YES + NO never exceeds `MAKER_MM_MAX_COMBINED`, guaranteeing profitability on every successful merge
-- **WebSocket real-time fill detection** — fills detected via RTDS WebSocket for sub-second response, with onchain balance as source of truth
 - **Market-neutral** — profits from spread capture only, never depends on price direction
 
 **Economics per cycle (default $5/side, 5 shares):**
